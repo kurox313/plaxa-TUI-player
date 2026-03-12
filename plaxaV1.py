@@ -296,165 +296,7 @@ def _fetch_lyrics(title: str, artist: str):
     except: return None
     finally: logging.disable(logging.NOTSET)
 
-# ── Animation engine ─────────────────────────────────────────────────────────── (FUCKING USELESS, just keep it here for now untill later fix, I guess...)
-ANIMATIONS = ["drop_bounce","rise_up","scale_in","shake",
-              "slide_left","slide_right","wave_in","pop_spin"]
-
-def _e_bounce(t):
-    n1,d1=7.5625,2.75
-    if t<1/d1:     return n1*t*t
-    elif t<2/d1:   t-=1.5/d1;  return n1*t*t+0.75
-    elif t<2.5/d1: t-=2.25/d1; return n1*t*t+0.9375
-    else:           t-=2.625/d1;return n1*t*t+0.984375
-
-def _e_elastic(t):
-    if t in(0,1): return t
-    return pow(2,-10*t)*math.sin((t*10-0.75)*(2*math.pi)/3)+1
-
-def _e_io(t): return t*t*(3-2*t)
-
-def _e_back(t):
-    c1,c3=1.70158,2.70158
-    return 1+c3*(t-1)**3+c1*(t-1)**2
-
-@dataclass
-class AnimState:
-    word:    str   = ""
-    anim:    str   = "drop_bounce"
-    phase:   str   = "in"
-    t:       float = 0.0
-    col_off: float = 0.0
-    row_off: float = 0.0
-    scale:   float = 1.0
-    alpha:   float = 1.0
-    done:    bool  = False
-
-def _render_word(state: AnimState, tw: int, th: int) -> str:
-    if state.done: return ""
-    top_row = 3; bot_row = th - CAVA_BAR_ROWS - 2
-    cx = tw//2; cy = (top_row+bot_row)//2
-    row = max(top_row, min(bot_row, int(round(cy+state.row_off))))
-    col = max(1, min(tw, int(round(cx+state.col_off))))
-    word = state.word
-    if state.scale < 0.5:   word = ""
-    elif state.scale < 0.8: word = word[::2] if len(word)>2 else word[:1]
-    a  = max(0.0, min(1.0, state.alpha))
-    fc = tuple(int(FG[i]*a + BG[i]*(1-a)) for i in range(3))
-    start = max(1, col - len(word)//2)
-    b = [move(row,start), bg(*BG), fg(*fc)]
-    if a > 0.85: b.append(bold())
-    b += [word, rst()]
-    return "".join(b)
-
-def _clear_word_area(tw: int, th: int) -> str:
-    top_row = 3; bot_row = th - CAVA_BAR_ROWS - 2
-    buf = []
-    for r in range(top_row, bot_row+1):
-        buf += [move(r,1), bg(*BG), ' '*tw, rst()]
-    return "".join(buf)
-
-def _tick_anim(state: AnimState, dt: float, hold_t: float):
-    a = state.anim; tw,_ = term_size()
-    if a == "drop_bounce":
-        IN,OUT = 0.25,0.15
-        if state.phase=="in":
-            state.t=min(1.0,state.t+dt/IN); state.row_off=-8*(1-_e_bounce(state.t)); state.alpha=state.t
-            if state.t>=1.0: state.phase="hold"; state.t=0
-        elif state.phase=="hold":
-            state.t=min(1.0,state.t+dt/hold_t); state.row_off=0
-            if state.t>=1.0: state.phase="out"; state.t=0
-        else:
-            state.t=min(1.0,state.t+dt/OUT); state.row_off=3*state.t; state.alpha=1-state.t
-            if state.t>=1.0: state.done=True
-    elif a == "rise_up":
-        IN,OUT=0.3,0.2
-        if state.phase=="in":
-            state.t=min(1.0,state.t+dt/IN); state.row_off=6*(1-_e_elastic(state.t)); state.alpha=state.t
-            if state.t>=1.0: state.phase="hold"; state.t=0
-        elif state.phase=="hold":
-            state.t=min(1.0,state.t+dt/hold_t); state.row_off=0
-            if state.t>=1.0: state.phase="out"; state.t=0
-        else:
-            state.t=min(1.0,state.t+dt/OUT); state.row_off=-4*state.t; state.alpha=1-state.t
-            if state.t>=1.0: state.done=True
-    elif a == "scale_in":
-        IN,OUT=0.2,0.15
-        if state.phase=="in":
-            state.t=min(1.0,state.t+dt/IN); state.scale=_e_back(state.t); state.alpha=state.t; state.row_off=0
-            if state.t>=1.0: state.phase="hold"; state.t=0
-        elif state.phase=="hold":
-            state.t=min(1.0,state.t+dt/hold_t); state.scale=1.0
-            if state.t>=1.0: state.phase="out"; state.t=0
-        else:
-            state.t=min(1.0,state.t+dt/OUT); state.scale=1-state.t; state.alpha=1-state.t
-            if state.t>=1.0: state.done=True
-    elif a == "shake":
-        IN,OUT=0.15,0.15
-        if state.phase=="in":
-            state.t=min(1.0,state.t+dt/IN); state.alpha=state.t
-            state.col_off=math.sin(state.t*math.pi*4)*2*(1-state.t)
-            if state.t>=1.0: state.phase="hold"; state.t=0
-        elif state.phase=="hold":
-            state.t=min(1.0,state.t+dt/hold_t)
-            state.col_off=math.sin(state.t*math.pi*6)*0.7; state.row_off=math.cos(state.t*math.pi*5)*0.4
-            if state.t>=1.0: state.phase="out"; state.t=0
-        else:
-            state.t=min(1.0,state.t+dt/OUT); state.alpha=1-state.t; state.col_off=0; state.row_off=0
-            if state.t>=1.0: state.done=True
-    elif a in ("slide_left","slide_right"):
-        IN,OUT=0.25,0.2; sign=1 if a=="slide_left" else -1
-        if state.phase=="in":
-            state.t=min(1.0,state.t+dt/IN); state.col_off=(tw//3)*sign*(1-_e_back(state.t)); state.alpha=state.t
-            if state.t>=1.0: state.phase="hold"; state.t=0
-        elif state.phase=="hold":
-            state.t=min(1.0,state.t+dt/hold_t); state.col_off=0
-            if state.t>=1.0: state.phase="out"; state.t=0
-        else:
-            state.t=min(1.0,state.t+dt/OUT); state.col_off=-(tw//3)*sign*state.t; state.alpha=1-state.t
-            if state.t>=1.0: state.done=True
-    elif a == "wave_in":
-        IN,OUT=0.3,0.2
-        if state.phase=="in":
-            state.t=min(1.0,state.t+dt/IN); state.row_off=math.sin(state.t*math.pi*3)*3*(1-state.t)
-            state.alpha=_e_io(state.t)
-            if state.t>=1.0: state.phase="hold"; state.t=0
-        elif state.phase=="hold":
-            state.t=min(1.0,state.t+dt/hold_t); state.row_off=math.sin(state.t*math.pi*2)*0.5
-            if state.t>=1.0: state.phase="out"; state.t=0
-        else:
-            state.t=min(1.0,state.t+dt/OUT); state.row_off=math.sin(state.t*math.pi)*2; state.alpha=1-state.t
-            if state.t>=1.0: state.done=True
-    elif a == "pop_spin":
-        IN,OUT=0.18,0.15
-        if state.phase=="in":
-            state.t=min(1.0,state.t+dt/IN); state.scale=_e_back(state.t)
-            state.col_off=math.sin(state.t*math.pi*2)*3*(1-state.t); state.alpha=state.t
-            if state.t>=1.0: state.phase="hold"; state.t=0
-        elif state.phase=="hold":
-            state.t=min(1.0,state.t+dt/hold_t); state.scale=1.0; state.col_off=0; state.row_off=0
-            if state.t>=1.0: state.phase="out"; state.t=0
-        else:
-            state.t=min(1.0,state.t+dt/OUT); state.scale=1-state.t*0.5; state.alpha=1-state.t
-            if state.t>=1.0: state.done=True
-
-# ── Lyrics schedule ────────────────────────────────────────────────────────────
-@dataclass
-class ScheduledWord:
-    word:     str
-    show_at:  float
-    beat_sec: float
-
-def _build_schedule(lines, prog_sec: float, mono_now: float) -> List[ScheduledWord]:
-    sched=[]; mono_off=mono_now-prog_sec
-    for i,(line_t,txt) in enumerate(lines):
-        words=txt.split()
-        if not words: continue
-        next_t=lines[i+1][0] if i+1<len(lines) else line_t+4.0
-        line_dur=max(0.5,next_t-line_t); wd=line_dur/len(words)
-        for j,w in enumerate(words):
-            wt=line_t+j*wd; bs=min(MAX_BEAT_MS/1000,max(MIN_BEAT_MS/1000,wd))
-            sched.append(ScheduledWord(w,mono_off+wt,bs))
-    return [s for s in sched if s.show_at>=mono_now-0.3]
+# ── Lyrics Display ────────────────────────────────────────────────────────────
 
 # ── Drawing ────────────────────────────────────────────────────────────────────
 def _draw_bg(tw: int, th: int):
@@ -630,10 +472,7 @@ class MediaController:
         self._last_line    : int  = -1
         self._slide        : float = 0.0
         self._prog_sync    : Optional[tuple] = None
-        self._anim_hist    : list = []
-        self._anim_state   : Optional[AnimState] = None
-        self._scheduled    : List[ScheduledWord] = []
-        self._sched_idx    : int = 0
+
         self._cava_source  : str = "auto"
         self._active_player: str = ""
         self._lyrics_enabled : bool = False
@@ -659,11 +498,6 @@ class MediaController:
                         self._last_tid=info.title; self._last_line=-1; self._slide=0.0
                         threading.Thread(target=self._reload_track,
                                          args=(info,prog_sec,mono_now),daemon=True).start()
-                    else:
-                        if self._prog_sync and info.status=='Playing':
-                            lm,lp=self._prog_sync
-                            if abs(prog_sec-(lp+mono_now-lm))>1.5:
-                                self._rebuild_sched(prog_sec,mono_now)
                     if info.status in('Playing','Paused'):
                         self._prog_sync=(mono_now,prog_sec)
                     if (info.title==self._info.title and info.status=='Playing' and
@@ -679,9 +513,8 @@ class MediaController:
         lrc=_fetch_lyrics(info.title,info.artist)
         lines=_parse_lrc(lrc) if lrc else []
         with self._lock:
-            self._lyrics=lines; self._anim_state=None; self._sched_idx=0
+            self._lyrics=lines
             self._translated=[]
-            self._rebuild_sched(prog_sec,mono_now)
         tw,th=term_size(); _draw_bg(tw,th)
         # Fetch translation in background
         if lines:
@@ -692,38 +525,12 @@ class MediaController:
         if result:
             with self._lock:
                 self._translated = result
-                # if user has translation mode active we need to rebuild the
-                # animation schedule immediately so the new words will flow
-                if self._translate_enabled:
-                    prog = self._info.position if self._info else 0.0
-                    self._rebuild_sched(prog, time.monotonic())
-
-    def _rebuild_sched(self, prog_sec: float, mono_now: float):
-        # only prepare a word‑by‑word animation schedule when translation mode
-        # is enabled and a translated result is available. for normal lyric
-        # display we simply clear the schedule so no floating words appear.
-        if self._translate_enabled and self._translated:
-            lines = [(t, self._translated[i] if i < len(self._translated) else txt)
-                     for i,(t,txt) in enumerate(self._lyrics)]
-            if lines:
-                self._scheduled = _build_schedule(lines, prog_sec, mono_now)
-                self._sched_idx = 0
-            else:
-                self._scheduled = []
-                self._sched_idx = 0
-        else:
-            self._scheduled = []
-            self._sched_idx = 0
 
     def _prog_now(self, now: float) -> float:
         with self._lock: sync=self._prog_sync; status=self._info.status
         if not sync: return 0.0
         lm,lp=sync
         return lp+(now-lm) if status=='Playing' else lp
-
-    def _pick_anim(self) -> str:
-        choices=[a for a in ANIMATIONS if a not in self._anim_hist[-2:]]
-        c=random.choice(choices); self._anim_hist.append(c); return c
 
     def _key_loop(self):
         import termios,tty
@@ -753,12 +560,6 @@ class MediaController:
                 elif ch in('t','T'):
                     with self._lock:
                         self._translate_enabled = not self._translate_enabled
-                        if not self._translate_enabled:
-                            # turning translation off should also cancel any
-                            # ongoing animations and clear schedule
-                            self._scheduled = []
-                            self._sched_idx = 0
-                            self._anim_state = None
         except: pass
 
     def _cmd(self,action):
@@ -825,25 +626,14 @@ class MediaController:
                 else:
                     _draw_karaoke(lyrics, prog_sec, tw, th, vis)
             elif info.status in('Playing','Paused'):
-                with self._lock: sched=self._scheduled; sidx=self._sched_idx
-                while sidx<len(sched) and now>=sched[sidx].show_at:
-                    sw=sched[sidx]; sidx+=1
-                    with self._lock: self._sched_idx=sidx
-                    self._anim_state=AnimState(word=sw.word,anim=self._pick_anim(),phase='in',t=0.0,alpha=0.0)
-                    write(_clear_word_area(tw,th))
-                state=self._anim_state
-                if state and not state.done:
-                    beat=sched[sidx-1].beat_sec if sidx>0 else 0.5
-                    _tick_anim(state,dt,beat*WORD_HOLD_FRAC); write(_render_word(state,tw,th))
-                elif not state:
-                    top=3; bot=th-CAVA_BAR_ROWS-2; mid=(top+bot)//2
-                    for r in range(top,bot+1): write(move(r,1)+bg(*BG)+' '*tw)
-                    if info.title:
-                        t=info.title[:tw-4]
-                        write(move(mid,max(1,(tw-len(t))//2))+bg(*BG)+fg(*FG)+bold()+t+rst())
-                    if info.artist:
-                        a=info.artist[:tw-4]
-                        write(move(mid+2,max(1,(tw-len(a))//2))+bg(*BG)+fg(*DIM)+a+rst())
+                top=3; bot=th-CAVA_BAR_ROWS-2; mid=(top+bot)//2
+                for r in range(top,bot+1): write(move(r,1)+bg(*BG)+' '*tw)
+                if info.title:
+                    t=info.title[:tw-4]
+                    write(move(mid,max(1,(tw-len(t))//2))+bg(*BG)+fg(*FG)+bold()+t+rst())
+                if info.artist:
+                    a=info.artist[:tw-4]
+                    write(move(mid+2,max(1,(tw-len(a))//2))+bg(*BG)+fg(*DIM)+a+rst())
             elif info.title and info.status=='Stopped':
                 top=3; bot=th-CAVA_BAR_ROWS-2; mid=(top+bot)//2
                 for r in range(top,bot+1): write(move(r,1)+bg(*BG)+' '*tw)
