@@ -10,6 +10,8 @@ ________________/\\\\\\________________________________________________
        _\/\\\__________/\\\\\\\\\_\//\\\\\\\\/\\__/\\\/\///\\\_\//\\\\\\\\/\\_ 
         _\///__________\/////////___\////////\//__\///____\///___\////////\//__
         
+mediactrl — Terminal Media Controller + Lyrics
+playerctl / MPRIS  ·  synced lyrics  ·  CAVA visualizer
 
 Requirements:
     playerctl cava
@@ -56,6 +58,50 @@ CAVA_BARS      = 64
 CAVA_BAR_ROWS  = 10
 CAVA_MAX_VAL   = 1000
 SLIDE_DURATION = 0.25
+# Lyrics sync offset in seconds — fallback when no entry found in the sync DB.
+# Use < and > keys at runtime to nudge by 0.25s and find the right value.
+SPOTIFY_LYRICS_OFFSET = 0
+
+# Remote sync offset database — set to None to disable
+LYRICS_SYNC_DB_URL = "https://raw.githubusercontent.com/kurox313/plaxa-lyric-sync-delay-lib/refs/heads/main/lyrics_sync.txt"
+
+# In-memory cache: (title_lower, artist_lower) -> float
+_sync_db: dict = {}
+_sync_db_loaded: bool = False
+
+def _load_sync_db() -> None:
+    """Fetch and parse the sync offset database from GitHub. Non-blocking — call in a thread."""
+    global _sync_db, _sync_db_loaded
+    if not LYRICS_SYNC_DB_URL or "YOUR_USER" in LYRICS_SYNC_DB_URL:
+        return
+    try:
+        import urllib.request
+        with urllib.request.urlopen(LYRICS_SYNC_DB_URL, timeout=5) as r:
+            text = r.read().decode("utf-8")
+        db = {}
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = [p.strip() for p in line.split("|")]
+            if len(parts) != 3:
+                continue
+            provider, title, delay = parts
+            try:
+                db[(provider.lower(), title.lower())] = float(delay)
+            except ValueError:
+                continue
+        _sync_db = db
+        _sync_db_loaded = True
+    except Exception:
+        pass  # silently fall back to SPOTIFY_LYRICS_OFFSET
+
+def _get_sync_offset(provider: str, title: str) -> float:
+    """
+    Look up sync offset by provider + title.
+    Falls back to SPOTIFY_LYRICS_OFFSET if not found.
+    """
+    return _sync_db.get((provider.lower(), title.lower()), SPOTIFY_LYRICS_OFFSET)
 
 # ── Terminal helpers ───────────────────────────────────────────────────────────
 ESC = "\033"
@@ -296,11 +342,17 @@ def _parse_lrc(text: str):
             if txt: out.append((t, txt))
     return sorted(out, key=lambda x: x[0])
 
-def _fetch_lyrics(title: str, artist: str):
+def _fetch_lyrics(title: str, artist: str, player: str = ""):
     if not _syncedlyrics: return None
     import logging
     logging.disable(logging.CRITICAL)
-    try:    return _syncedlyrics.search(f"{title} {artist}")
+    query = f"{title} {artist}"
+    try:
+        if "spotify" in player.lower():
+            lrc = _syncedlyrics.search(query, providers=["Spotify"])
+            if lrc:
+                return lrc
+        return _syncedlyrics.search(query, providers=["Musixmatch", "NetEase", "LRClib", "Megalobiz"])
     except: return None
     finally: logging.disable(logging.NOTSET)
 
@@ -312,7 +364,7 @@ def _draw_bg(tw: int, th: int):
     for r in range(1,th+1): buf.append(move(r,1)+bg(*BG)+' '*tw)
     write("".join(buf)+rst())
 
-def _draw_topbar(info: TrackInfo, players: List[str], tw: int):
+def _draw_topbar(info: TrackInfo, players: List[str], tw: int, lyrics_offset: float = 0.0, lyrics_player: str = "", advanced_mode: bool = False):
     buf=[move(1,1)]; col=1
     for p in players:
         short=p.split('.')[-1][:12]; active=(p==info.player); label=f" {short} "
@@ -329,7 +381,10 @@ def _draw_topbar(info: TrackInfo, players: List[str], tw: int):
     if info.artist:
         artist=f"  {info.artist}"[:max(0,tw-col-10)]
         buf+=[fg(*DIM),artist,rst(),bg(*BG)]; col+=len(artist)
-    vol_str=f" vol {int(info.volume*100)}% "
+    if "spotify" in lyrics_player.lower() and advanced_mode:
+        vol_str=f" vol {int(info.volume*100)}%  sync:{lyrics_offset:+.2f}s "
+    else:
+        vol_str=f" vol {int(info.volume*100)}% "
     buf+=[' '*max(0,tw-col-len(vol_str)),fg(*DIM),vol_str,rst()]
     write("".join(buf))
 
@@ -374,7 +429,7 @@ def _draw_karaoke(lines, prog_sec: float, tw: int, th: int, slide: float):
         _,txt=lines[idx]; text=txt.strip()
         edge=1.0-min(1.0,abs(slide)*abs(offset)*0.15)
         if offset==0:
-            content=">> "+text
+            content=">> "+text+" <<"
             if len(content)>tw-2: content=content[:tw-2]
             col=max(1,(tw-len(content))//2)
             blend=1.0-abs(slide)*0.6
@@ -428,13 +483,13 @@ def _draw_karaoke_split(lines, translated, prog_sec: float, tw: int, th: int, sl
             bfg   = tuple(int(BG[i]*blend + ACCENT[i]*(1-blend)) for i in range(3))
             # Left — original
             lo = orig_text[:col_w-3]
-            lc = ">> " + lo
+            lc = ">> " + lo + " <<"
             lcol = max(1, (div_col - len(lc)) // 2)
             buf += [move(row, 1), bg(*bglow), ' '*(div_col-1),
                     move(row, lcol), bg(*bglow), fg(*bfg), bold(), lc, rst()]
             # Right — translation
             ro2 = trans_text[:col_w-3]
-            rc  = ">> " + ro2
+            rc  = ">> " + ro2 + " <<"
             rcol = div_col + 1 + max(0, (col_w - len(rc)) // 2)
             buf += [move(row, div_col+1), bg(*bglow), ' '*(tw-div_col),
                     move(row, rcol), bg(*bglow), fg(*bfg), bold(), rc, rst()]
@@ -459,8 +514,13 @@ def _draw_no_players(tw: int, th: int):
         col=max(1,(tw-len(m))//2)
         write(move(mid-1+i,col)+bg(*BG)+fg(*(FG if i==0 else DIM))+(bold() if i==0 else '')+m+rst())
 
+def _draw_advanced(offset: float, tw: int, th: int):
+    """Advanced mode overlay — shown one row above controls."""
+    label = f" ── ADVANCED  [,] sync:{offset:+.2f}s [.]  ── "
+    write(move(th-1, 1) + bg(*ACCENT) + fg(*BG) + bold() + label[:tw].center(tw) + rst())
+
 def _draw_controls(tw: int, th: int):
-    hint=" [Space] ▶⏸  [←][→] ⏮⏭  [↑][↓] Vol  [][  ] Seek  [Tab] Player  [L] Lyrics  [T] Translate  [q] Quit "
+    hint=" [Space] ▶⏸  [←][→] ⏮⏭  [↑][↓] Vol  [][  ] Seek  [Tab] Player  [L] Lyrics  [T] Translate  [A] Advanced  [q] Quit "
     write(move(th,1)+bg(*BG)+fg(*DIM)+hint[:tw].center(tw)+rst())
 
 # ── Main controller ────────────────────────────────────────────────────────────
@@ -483,6 +543,9 @@ class MediaController:
 
         self._cava_source  : str = "auto"
         self._active_player: str = ""
+        self._lyrics_player: str = ""   # player name when current lyrics were fetched
+        self._lyrics_offset: float = SPOTIFY_LYRICS_OFFSET  # runtime-adjustable
+        self._advanced_mode: bool = False
         self._lyrics_enabled : bool = False
         self._translate_enabled: bool = False
         self._translated     : list = []   # list of translated lines corresponding to self._lyrics
@@ -518,10 +581,17 @@ class MediaController:
             time.sleep(POLL_INTERVAL)
 
     def _reload_track(self, info: TrackInfo, prog_sec: float, mono_now: float):
-        lrc=_fetch_lyrics(info.title,info.artist)
+        lrc=_fetch_lyrics(info.title,info.artist,info.player)
         lines=_parse_lrc(lrc) if lrc else []
+        # Look up per-song offset from DB (only applies when Spotify is the provider)
+        if "spotify" in info.player.lower():
+            offset = _get_sync_offset("spotify", info.title)
+        else:
+            offset = 0.0
         with self._lock:
             self._lyrics=lines
+            self._lyrics_player=info.player
+            self._lyrics_offset=offset
             self._translated=[]
         tw,th=term_size(); _draw_bg(tw,th)
         # Fetch translation in background
@@ -562,6 +632,14 @@ class MediaController:
                     elif rest=='[B': self._vol(-0.1)
                 elif ch=='[': self._seek(-5)
                 elif ch==']': self._seek(+5)
+                elif ch in('a','A'):
+                    with self._lock: self._advanced_mode = not self._advanced_mode
+                elif ch in(',','<'):
+                    if self._advanced_mode:
+                        self._lyrics_offset = round(self._lyrics_offset - 0.25, 2)
+                elif ch in('.', '>'):
+                    if self._advanced_mode:
+                        self._lyrics_offset = round(self._lyrics_offset + 0.25, 2)
                 elif ch in('l','L'):
                     with self._lock:
                         self._lyrics_enabled = not self._lyrics_enabled
@@ -592,9 +670,11 @@ class MediaController:
         signal.signal(signal.SIGWINCH,lambda *_: setattr(self,'_resize',True))
         self._running=True
         self.cava.start(self._cava_source)
+        threading.Thread(target=_load_sync_db, daemon=True).start()
         threading.Thread(target=self._poll_loop,daemon=True).start()
         threading.Thread(target=self._key_loop, daemon=True).start()
-        write(hide_cur()+clear())
+        # Full clear: reset scroll region, clear scrollback, move to top-left
+        write("\033[r\033[H\033[2J\033[3J" + hide_cur())
         tw,th=term_size(); _draw_bg(tw,th)
         frame_time=1.0/ANIMATION_FPS; last_frame=time.monotonic()
         while self._running:
@@ -606,33 +686,39 @@ class MediaController:
                 tw,th=term_size()
             with self._lock:
                 info=TrackInfo(**vars(self._info)); lyrics=list(self._lyrics); players=list(self._players)
-                lyrics_on   = self._lyrics_enabled
-                trans_on    = self._translate_enabled
-                translated  = list(self._translated)
+                lyrics_on    = self._lyrics_enabled
+                trans_on     = self._translate_enabled
+                translated   = list(self._translated)
+                lyrics_player= self._lyrics_player
             prog_sec=self._prog_now(now)
             if info.status=='Playing' and info.duration>0:
                 info.position=min(info.duration,prog_sec)
                 with self._lock: self._info.position=info.position
+            # Apply per-provider offset to lyrics position only (not progress bar)
+            if "spotify" in lyrics_player.lower():
+                lyrics_prog_sec = prog_sec + self._lyrics_offset
+            else:
+                lyrics_prog_sec = prog_sec
             _draw_cava(self.cava.get(),tw,th)
-            _draw_topbar(info,players,tw)
+            _draw_topbar(info,players,tw,self._lyrics_offset,lyrics_player,self._advanced_mode)
             _draw_progress(info,tw)
             if not players:
                 _draw_no_players(tw,th)
             elif lyrics and lyrics_on and info.status in('Playing','Paused'):
                 cur=0
                 for i,(t,_) in enumerate(lyrics):
-                    if t<=prog_sec: cur=i
+                    if t<=lyrics_prog_sec: cur=i
                 if cur!=self._last_line and self._last_line!=-1: self._slide=1.0
-                if self._last_line==-1: _draw_bg(tw,th); _draw_topbar(info,players,tw); _draw_progress(info,tw)
+                if self._last_line==-1: _draw_bg(tw,th); _draw_topbar(info,players,tw,self._lyrics_offset,lyrics_player,self._advanced_mode); _draw_progress(info,tw)
                 self._last_line=cur
                 if self._slide>0.0:
                     self._slide=max(0.0,self._slide-dt/SLIDE_DURATION)
                     vis=self._slide**2*(3-2*self._slide)
                 else: vis=0.0
                 if trans_on:
-                    _draw_karaoke_split(lyrics, translated, prog_sec, tw, th, vis)
+                    _draw_karaoke_split(lyrics, translated, lyrics_prog_sec, tw, th, vis)
                 else:
-                    _draw_karaoke(lyrics, prog_sec, tw, th, vis)
+                    _draw_karaoke(lyrics, lyrics_prog_sec, tw, th, vis)
             elif info.status in('Playing','Paused'):
                 top=3; bot=th-CAVA_BAR_ROWS-2; mid=(top+bot)//2
                 for r in range(top,bot+1): write(move(r,1)+bg(*BG)+' '*tw)
@@ -647,6 +733,8 @@ class MediaController:
                 for r in range(top,bot+1): write(move(r,1)+bg(*BG)+' '*tw)
                 msg=f"⏹  {info.title}"
                 write(move(mid,max(1,(tw-len(msg))//2))+bg(*BG)+fg(*DIM)+msg+rst())
+            if self._advanced_mode:
+                _draw_advanced(self._lyrics_offset, tw, th)
             _draw_controls(tw,th)
             elapsed=time.monotonic()-now
             time.sleep(max(0,frame_time-elapsed))
