@@ -134,6 +134,26 @@ def _try(pkg):
 _syncedlyrics  = _try("syncedlyrics")
 _deep_translator = _try("deep_translator")
 
+# Supported translation target languages (code -> display name)
+TRANSLATE_LANGS = [
+    ("en",    "English"),
+    ("th",    "Thai"),
+    ("ja",    "Japanese"),
+    ("ko",    "Korean"),
+    ("zh-CN", "Chinese (Simplified)"),
+    ("zh-TW", "Chinese (Traditional)"),
+    ("es",    "Spanish"),
+    ("fr",    "French"),
+    ("de",    "German"),
+    ("pt",    "Portuguese"),
+    ("ru",    "Russian"),
+    ("ar",    "Arabic"),
+    ("it",    "Italian"),
+    ("vi",    "Vietnamese"),
+    ("id",    "Indonesian"),
+]
+TRANSLATE_LANG_CODES = [c for c,_ in TRANSLATE_LANGS]
+
 def _translate_lines(lines, target_lang="en"):
     """Translate a list of (time, text) pairs. Returns list of translated strings or None."""
     if not lines:
@@ -342,18 +362,39 @@ def _parse_lrc(text: str):
             if txt: out.append((t, txt))
     return sorted(out, key=lambda x: x[0])
 
+def _is_cjk(text: str) -> bool:
+    """True if text contains CJK characters (Japanese, Chinese, Korean)."""
+    for ch in text:
+        cp = ord(ch)
+        if (0x3000 <= cp <= 0x9FFF or   # CJK, Hiragana, Katakana
+            0xAC00 <= cp <= 0xD7AF or   # Korean Hangul
+            0xF900 <= cp <= 0xFAFF or   # CJK compatibility
+            0x20000 <= cp <= 0x2A6DF):  # CJK extension B
+            return True
+    return False
+
 def _fetch_lyrics(title: str, artist: str, player: str = ""):
-    if not _syncedlyrics: return None
+    """Returns (lrc_text, provider_name) or (None, None)."""
+    if not _syncedlyrics: return None, None
     import logging
     logging.disable(logging.CRITICAL)
     query = f"{title} {artist}"
+    # For CJK songs, NetEase has better sync than Musixmatch — prioritise it
+    if _is_cjk(title) or _is_cjk(artist):
+        fallback_order = ["NetEase", "Musixmatch", "LRClib", "spotify", "Megalobiz", "none"]
+    else:
+        fallback_order = ["NetEase", "Musixmatch", "LRClib", "spotify", "Megalobiz", "none"]
     try:
         if "spotify" in player.lower():
             lrc = _syncedlyrics.search(query, providers=["Spotify"])
             if lrc:
-                return lrc
-        return _syncedlyrics.search(query, providers=["Musixmatch", "NetEase", "LRClib", "Megalobiz"])
-    except: return None
+                return lrc, "Spotify"
+        for provider in fallback_order:
+            lrc = _syncedlyrics.search(query, providers=[provider])
+            if lrc:
+                return lrc, provider
+        return None, None
+    except: return None, None
     finally: logging.disable(logging.NOTSET)
 
 # ── Lyrics Display ────────────────────────────────────────────────────────────
@@ -514,13 +555,26 @@ def _draw_no_players(tw: int, th: int):
         col=max(1,(tw-len(m))//2)
         write(move(mid-1+i,col)+bg(*BG)+fg(*(FG if i==0 else DIM))+(bold() if i==0 else '')+m+rst())
 
-def _draw_advanced(offset: float, tw: int, th: int):
-    """Advanced mode overlay — shown one row above controls."""
-    label = f" ── ADVANCED  [,] sync:{offset:+.2f}s [.]  ── "
+def _draw_advanced(offset: float, provider: str, translate_lang: str,
+                   lang_select: bool, tw: int, th: int):
+    """Advanced mode overlay — row th-1. Shows lang picker when active."""
+    if lang_select:
+        # Language picker row
+        idx     = TRANSLATE_LANG_CODES.index(translate_lang) if translate_lang in TRANSLATE_LANG_CODES else 0
+        prev_i  = (idx - 1) % len(TRANSLATE_LANGS)
+        next_i  = (idx + 1) % len(TRANSLATE_LANGS)
+        _, cur_name  = TRANSLATE_LANGS[idx]
+        _, prev_name = TRANSLATE_LANGS[prev_i]
+        _, next_name = TRANSLATE_LANGS[next_i]
+        label = f" LANGUAGE  [,] {prev_name}  ◀  {cur_name}  ▶  {next_name} [.]   [Enter] confirm "
+    else:
+        prov_str = provider if provider else "none"
+        cur_lang = dict(TRANSLATE_LANGS).get(translate_lang, translate_lang)
+        label = f" ── ADVANCED  [,] sync:{offset:+.2f}s [.]   provider:{prov_str}   lang:{cur_lang} [G]  ── "
     write(move(th-1, 1) + bg(*ACCENT) + fg(*BG) + bold() + label[:tw].center(tw) + rst())
 
 def _draw_controls(tw: int, th: int):
-    hint=" [Space] ▶⏸  [←][→] ⏮⏭  [↑][↓] Vol  [][  ] Seek  [Tab] Player  [L] Lyrics  [T] Translate  [A] Advanced  [q] Quit "
+    hint=" [Space] ▶⏸  [←][→] ⏮⏭  [↑][↓] Vol  [][  ] Seek  [Tab] Player  [L] Lyrics  [T] Translate  [A] Advanced  [G] Language  [q] Quit "
     write(move(th,1)+bg(*BG)+fg(*DIM)+hint[:tw].center(tw)+rst())
 
 # ── Main controller ────────────────────────────────────────────────────────────
@@ -549,6 +603,9 @@ class MediaController:
         self._lyrics_enabled : bool = False
         self._translate_enabled: bool = False
         self._translated     : list = []   # list of translated lines corresponding to self._lyrics
+        self._lyrics_provider: str  = ""   # which provider served the lyrics
+        self._translate_lang : str  = "en" # current target language code
+        self._lang_select_mode: bool = False  # show language picker in advanced
 
     def _poll_loop(self):
         while self._running:
@@ -581,7 +638,7 @@ class MediaController:
             time.sleep(POLL_INTERVAL)
 
     def _reload_track(self, info: TrackInfo, prog_sec: float, mono_now: float):
-        lrc=_fetch_lyrics(info.title,info.artist,info.player)
+        lrc,provider=_fetch_lyrics(info.title,info.artist,info.player)
         lines=_parse_lrc(lrc) if lrc else []
         # Look up per-song offset from DB (only applies when Spotify is the provider)
         if "spotify" in info.player.lower():
@@ -591,15 +648,16 @@ class MediaController:
         with self._lock:
             self._lyrics=lines
             self._lyrics_player=info.player
+            self._lyrics_provider=provider or ""
             self._lyrics_offset=offset
             self._translated=[]
         tw,th=term_size(); _draw_bg(tw,th)
         # Fetch translation in background
         if lines:
-            threading.Thread(target=self._fetch_translation, args=(lines,), daemon=True).start()
+            threading.Thread(target=self._fetch_translation, args=(lines, self._translate_lang), daemon=True).start()
 
-    def _fetch_translation(self, lines):
-        result = _translate_lines(lines)
+    def _fetch_translation(self, lines, target_lang="en"):
+        result = _translate_lines(lines, target_lang)
         if result:
             with self._lock:
                 self._translated = result
@@ -633,19 +691,47 @@ class MediaController:
                 elif ch=='[': self._seek(-5)
                 elif ch==']': self._seek(+5)
                 elif ch in('a','A'):
-                    with self._lock: self._advanced_mode = not self._advanced_mode
+                    with self._lock:
+                        self._advanced_mode = not self._advanced_mode
+                        if not self._advanced_mode:
+                            self._lang_select_mode = False
                 elif ch in(',','<'):
-                    if self._advanced_mode:
+                    if self._advanced_mode and not self._lang_select_mode:
                         self._lyrics_offset = round(self._lyrics_offset - 0.25, 2)
+                    elif self._lang_select_mode:
+                        # cycle language backwards
+                        idx = TRANSLATE_LANG_CODES.index(self._translate_lang) if self._translate_lang in TRANSLATE_LANG_CODES else 0
+                        self._translate_lang = TRANSLATE_LANG_CODES[(idx - 1) % len(TRANSLATE_LANG_CODES)]
+                        self._translated = []  # clear so re-fetch triggers
                 elif ch in('.', '>'):
-                    if self._advanced_mode:
+                    if self._advanced_mode and not self._lang_select_mode:
                         self._lyrics_offset = round(self._lyrics_offset + 0.25, 2)
+                    elif self._lang_select_mode:
+                        # cycle language forwards
+                        idx = TRANSLATE_LANG_CODES.index(self._translate_lang) if self._translate_lang in TRANSLATE_LANG_CODES else 0
+                        self._translate_lang = TRANSLATE_LANG_CODES[(idx + 1) % len(TRANSLATE_LANG_CODES)]
+                        self._translated = []  # clear so re-fetch triggers
+                elif ch in('\r', '\n'):
+                    if self._lang_select_mode:
+                        # confirm language — retranslate
+                        with self._lock:
+                            self._lang_select_mode = False
+                            lines = list(self._lyrics)
+                            lang  = self._translate_lang
+                        if lines:
+                            threading.Thread(target=self._fetch_translation,
+                                             args=(lines, lang), daemon=True).start()
                 elif ch in('l','L'):
                     with self._lock:
                         self._lyrics_enabled = not self._lyrics_enabled
                 elif ch in('t','T'):
                     with self._lock:
                         self._translate_enabled = not self._translate_enabled
+                elif ch in('g','G'):
+                    # open language picker (only in advanced mode)
+                    if self._advanced_mode:
+                        with self._lock:
+                            self._lang_select_mode = not self._lang_select_mode
         except: pass
 
     def _cmd(self,action):
@@ -689,7 +775,10 @@ class MediaController:
                 lyrics_on    = self._lyrics_enabled
                 trans_on     = self._translate_enabled
                 translated   = list(self._translated)
-                lyrics_player= self._lyrics_player
+                lyrics_player   = self._lyrics_player
+                lyrics_provider = self._lyrics_provider
+                lang_select     = self._lang_select_mode
+                translate_lang  = self._translate_lang
             prog_sec=self._prog_now(now)
             if info.status=='Playing' and info.duration>0:
                 info.position=min(info.duration,prog_sec)
@@ -734,7 +823,8 @@ class MediaController:
                 msg=f"⏹  {info.title}"
                 write(move(mid,max(1,(tw-len(msg))//2))+bg(*BG)+fg(*DIM)+msg+rst())
             if self._advanced_mode:
-                _draw_advanced(self._lyrics_offset, tw, th)
+                _draw_advanced(self._lyrics_offset, lyrics_provider,
+                               translate_lang, lang_select, tw, th)
             _draw_controls(tw,th)
             elapsed=time.monotonic()-now
             time.sleep(max(0,frame_time-elapsed))
