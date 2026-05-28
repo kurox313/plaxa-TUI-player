@@ -3,7 +3,7 @@
 
 ### SETUP 
 python <br>
-```pip install syncedlyrics deep-translator``` <br>
+```pip install --break-system-packages syncedlyrics deep-translator``` <br>
 
 Linux
 
